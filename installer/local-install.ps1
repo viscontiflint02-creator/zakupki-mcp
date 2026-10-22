@@ -245,10 +245,9 @@ try {
     $schema = if (([version]$version).Major -ge 2) { 'v2' } else { 'v1' }
 
     Write-Step 'uv и Python'
-    # Корпоративная сеть подменяет HTTPS-сертификаты своим: uv должен доверять хранилищу Windows.
-    $env:UV_NATIVE_TLS = '1'
-    # Свой Python от uv, а не случайный найденный на ПК (его могут удалить вместе с чужой программой).
-    $env:UV_PYTHON_PREFERENCE = 'only-managed'
+    # Python, уже установленный на ПК (или ранее скачанный uv), без скачивания: корпоративная
+    # сеть не пускает к архивам Python на GitHub. Скачивание - только если Python 3.12 нет совсем.
+    $env:UV_PYTHON_PREFERENCE = 'managed'
     $uv = (Get-Command uv -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     if (-not $uv) {
         $uvDir = Join-Path $root 'uv'
@@ -260,6 +259,9 @@ try {
         }
     }
     Write-Host "    uv: $uv"
+    # Корпоративная сеть подменяет HTTPS-сертификаты своим: uv должен доверять хранилищу Windows.
+    # В новых uv настройка называется UV_SYSTEM_CERTS, в старых - UV_NATIVE_TLS.
+    if (((& $uv --help) -join "`n") -match 'system-certs') { $env:UV_SYSTEM_CERTS = '1' } else { $env:UV_NATIVE_TLS = '1' }
 
     Write-Step "MCP с GitHub ($Repo, ветка $Branch)"
     $unpacked = Expand-Download "https://codeload.github.com/$Repo/zip/refs/heads/$Branch" 'mcp.zip'
@@ -270,14 +272,18 @@ try {
     Move-Item -LiteralPath $source.FullName -Destination $app
     $venv = Join-Path $root 'venv'
     if (Test-Path -LiteralPath $venv) {
-        # Пересоздаём на своём Python; если MCP сейчас запущен OpenCode, файлы заняты — оставляем как есть.
+        # Пересоздаём на своём Python; если MCP сейчас запущен OpenCode, файлы заняты - оставляем как есть.
         try { Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction Stop }
         catch { Write-Host '    Python-окружение занято (OpenCode открыт?) - обновляю на месте.' -ForegroundColor Yellow }
     }
-    & $uv --native-tls venv --python 3.12 --allow-existing $venv | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw 'Не удалось подготовить Python 3.12 (uv venv).' }
+    Write-Host '    Готовлю Python 3.12...'
+    & $uv venv --python 3.12 --allow-existing $venv | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Не удалось подготовить Python 3.12: на компьютере его нет, а скачать не дала сеть. Установите Python 3.12 с python.org (или через ИТ) и запустите установщик снова.'
+    }
     $python = Join-Path $venv 'Scripts\python.exe'
-    & $uv --native-tls pip install --python $python -r (Join-Path $app 'requirements.lock') | Out-Host
+    Write-Host '    Устанавливаю библиотеки MCP...'
+    & $uv pip install --python $python -r (Join-Path $app 'requirements.lock') | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw 'Не удалось установить зависимости MCP. Если выше «UnknownIssuer» или «certificate» - сеть не пускает к pypi.org; если «Connect» - нет доступа в интернет.'
     }
