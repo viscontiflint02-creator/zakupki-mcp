@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Repo,
     [string]$Branch = 'main',
     [string]$GoogleClient = '',
-    [string]$SpreadsheetId = '1-G3IRekmQzsVE1DZiGujmUomZ8mUve9DhZftCvVFtJw',
+    [Parameter(Mandatory = $true)][string]$SpreadsheetId,
     [string]$SheetName = 'незакр 2025/26',
     [string]$LetAIBaseUrl = 'http://10.19.27.103:4000/v1',
     [string]$LetAIModel = 'LetAI-ONE'

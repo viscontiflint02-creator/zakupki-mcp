@@ -29,11 +29,11 @@ MCP-сервер, который запускается на компьютер�
 
 1. Google Cloud: включить Google Sheets API и Google Drive API. Создать OAuth client
    **Desktop app** и перевести consent screen в **In production**.
-2. Собрать установщик с ключом клиента. Ключ в GitHub не кладём: GitHub сообщает о таких
+2. Собрать установщик с ключом клиента и ID таблицы заявок (ID — часть ссылки между /d/ и /edit). Их в GitHub не кладём: GitHub сообщает о таких
    ключах в Google, и клиент отключается.
 
    ```powershell
-   .\tools\Make-Installer.ps1 -Repo <владелец>/<репозиторий> -GoogleClientPath C:\path\client_secret.json
+   .\tools\Make-Installer.ps1 -Repo <владелец>/<репозиторий> -GoogleClientPath C:\path\client_secret.json `\n     -SpreadsheetId <ID таблицы заявок>
    ```
 
 3. Раздать получившийся `Установить-MCP.bat` сотрудникам внутри компании.
