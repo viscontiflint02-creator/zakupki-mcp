@@ -46,6 +46,7 @@ function Get-LatestOpenCode([string]$Asset) {
 }
 
 function Get-OpenCodeVersion([string]$Path) {
+    $ErrorActionPreference = 'Continue'  # вывод в stderr не должен обрывать установку
     $text = "$(& $Path --version 2>$null | Select-Object -First 1)"
     if ($text -match '(\d+\.\d+\.\d+)') { return $Matches[1] }
     return $null
@@ -85,6 +86,59 @@ function Install-OpenCode($Latest, [string]$Asset) {
     Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $opencodeDir 'opencode.exe') -Force
     Add-UserPath $opencodeDir
     return (Join-Path $opencodeDir 'opencode.exe')
+}
+
+function Test-PythonSignature([string]$Path) {
+    # Официальные python.exe и установщик подписаны Python Software Foundation.
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    return $signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -match 'Python Software Foundation'
+}
+
+function Find-Python312 {
+    # Python 3.12, уже стоящий на ПК: свой из прошлой установки, py-лаунчер, PATH.
+    # Ярлык Microsoft Store (WindowsApps\python.exe) не подходит: он открывает магазин.
+    # PowerShell 5.1 в режиме Stop обрывает скрипт на любом выводе программы в stderr
+    # (например, «py: No runtime installed»), даже с 2>$null: внутри функции - Continue.
+    $ErrorActionPreference = 'Continue'
+    $candidates = @(Join-Path $root 'python\python.exe')
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        $candidates += "$(& py -3.12 -c 'import sys; print(sys.executable)' 2>$null)".Trim()
+    }
+    $candidates += @(Get-Command python, python3 -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source })
+    foreach ($candidate in $candidates) {
+        if (-not $candidate -or -not (Test-Path -LiteralPath $candidate) -or $candidate -match '\\WindowsApps\\') { continue }
+        $version = "$(& $candidate -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null)".Trim()
+        if ($version -eq '3.12') { return $candidate }
+    }
+    return $null
+}
+
+function Install-Python {
+    # Python 3.12 для ПК, где его нет. Архивы Python на GitHub корпоративная сеть не пускает,
+    # поэтому: официальный пакет NuGet (архив, без установки в систему и прав администратора),
+    # иначе установщик python.org (тихо, только для текущего пользователя). Подпись проверяется.
+    $version = '3.12.10'
+    $target = Join-Path $root 'python'
+    $exe = Join-Path $target 'python.exe'
+    try {
+        $unpacked = Expand-Download "https://api.nuget.org/v3-flatcontainer/python/$version/python.$version.nupkg" 'python.zip'
+        $tools = Join-Path $unpacked 'tools'
+        if (-not (Test-PythonSignature (Join-Path $tools 'python.exe'))) { throw 'подпись python.exe не прошла проверку' }
+        if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+        Copy-Item -LiteralPath $tools -Destination $target -Recurse
+        return $exe
+    } catch {
+        Write-Host "    NuGet не подошёл ($($_.Exception.Message)), беру установщик с python.org." -ForegroundColor Yellow
+    }
+    $installer = Join-Path ([IO.Path]::GetTempPath()) "python-$version-amd64.exe"
+    Write-Host "    Скачиваю https://www.python.org/ftp/python/$version/python-$version-amd64.exe"
+    Invoke-WebRequest -UseBasicParsing -Uri "https://www.python.org/ftp/python/$version/python-$version-amd64.exe" -OutFile $installer
+    if (-not (Test-PythonSignature $installer)) { throw 'Подпись установщика Python не прошла проверку - файл не запускаю.' }
+    $arguments = "/quiet InstallAllUsers=0 PrependPath=0 Include_launcher=0 Include_test=0 Include_doc=0 " +
+        "Include_tcltk=0 Shortcuts=0 AssociateFiles=0 TargetDir=`"$target`""
+    $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+    if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $exe)) { throw "Установщик Python завершился с кодом $($process.ExitCode)" }
+    return $exe
 }
 
 function Remove-JsonComments([string]$Text) {
@@ -244,25 +298,6 @@ try {
     if (-not $version) { throw "Не удалось определить версию OpenCode ($opencode --version)" }
     $schema = if (([version]$version).Major -ge 2) { 'v2' } else { 'v1' }
 
-    Write-Step 'uv и Python'
-    # Python, уже установленный на ПК (или ранее скачанный uv), без скачивания: корпоративная
-    # сеть не пускает к архивам Python на GitHub. Скачивание - только если Python 3.12 нет совсем.
-    $env:UV_PYTHON_PREFERENCE = 'managed'
-    $uv = (Get-Command uv -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-    if (-not $uv) {
-        $uvDir = Join-Path $root 'uv'
-        $uv = Join-Path $uvDir 'uv.exe'
-        if (-not (Test-Path -LiteralPath $uv)) {
-            $unpacked = Expand-Download 'https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip' 'uv.zip'
-            New-Item -ItemType Directory -Force -Path $uvDir | Out-Null
-            Get-ChildItem -LiteralPath $unpacked -Recurse -Filter 'uv*.exe' | Copy-Item -Destination $uvDir -Force
-        }
-    }
-    Write-Host "    uv: $uv"
-    # Корпоративная сеть подменяет HTTPS-сертификаты своим: uv должен доверять хранилищу Windows.
-    # В новых uv настройка называется UV_SYSTEM_CERTS, в старых - UV_NATIVE_TLS.
-    if (((& $uv --help) -join "`n") -match 'system-certs') { $env:UV_SYSTEM_CERTS = '1' } else { $env:UV_NATIVE_TLS = '1' }
-
     Write-Step "MCP с GitHub ($Repo, ветка $Branch)"
     $unpacked = Expand-Download "https://codeload.github.com/$Repo/zip/refs/heads/$Branch" 'mcp.zip'
     $source = Get-ChildItem -LiteralPath $unpacked -Directory | Select-Object -First 1
@@ -276,16 +311,37 @@ try {
         try { Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction Stop }
         catch { Write-Host '    Python-окружение занято (OpenCode открыт?) - обновляю на месте.' -ForegroundColor Yellow }
     }
-    Write-Host '    Готовлю Python 3.12...'
-    & $uv venv --python 3.12 --allow-existing $venv | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Не удалось подготовить Python 3.12: на компьютере его нет, а скачать не дала сеть. Установите Python 3.12 с python.org (или через ИТ) и запустите установщик снова.'
+    Write-Step 'Python 3.12 и библиотеки'
+    $basePython = Find-Python312
+    if (-not $basePython) {
+        Write-Host '    Python 3.12 на компьютере нет - ставлю официальный (около 25 МБ).'
+        $basePython = Install-Python
     }
+    Write-Host "    Python: $basePython"
     $python = Join-Path $venv 'Scripts\python.exe'
-    Write-Host '    Устанавливаю библиотеки MCP...'
-    & $uv pip install --python $python -r (Join-Path $app 'requirements.lock') | Out-Host
+    if (-not (Test-Path -LiteralPath $python)) {
+        # Стандартный venv: pip в нём берётся из самого Python (ensurepip), без интернета.
+        & $basePython -m venv $venv | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать Python-окружение (python -m venv).' }
+    }
+    $ErrorActionPreference = 'Continue'
+    & $python -m pip --version 2>$null | Out-Null
+    $hasPip = $LASTEXITCODE -eq 0
+    $ErrorActionPreference = 'Stop'
+    if (-not $hasPip) {
+        # Окружение от прошлой версии установщика (uv) было без pip: добавляем его из самого Python.
+        & $python -m ensurepip --upgrade | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'В Python-окружении нет pip. Закройте OpenCode и запустите установщик снова.' }
+    }
+    # pip 24.2+ проверяет HTTPS через хранилище Windows (truststore) - как браузер и PowerShell,
+    # поэтому корпоративная проверка HTTPS ему не мешает. У старого pip включаем это явно.
+    $pipVersion = "$(& $python -m pip --version)" -replace '^pip (\d+\.\d+).*', '$1'
+    $pipArgs = @('-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', '-r', (Join-Path $app 'requirements.lock'))
+    if ([version]$pipVersion -lt [version]'24.2') { $pipArgs += '--use-feature=truststore' }
+    Write-Host '    Устанавливаю библиотеки MCP (pip, с проверкой хешей)...'
+    & $python @pipArgs | Out-Host
     if ($LASTEXITCODE -ne 0) {
-        throw 'Не удалось установить зависимости MCP. Если выше «UnknownIssuer» или «certificate» - сеть не пускает к pypi.org; если «Connect» - нет доступа в интернет.'
+        throw 'Не удалось установить библиотеки MCP с pypi.org. Если выше «certificate» - сеть не доверяет pypi.org; если «Connection» - нет доступа в интернет.'
     }
 
     Write-Step 'Google'
