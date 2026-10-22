@@ -33,7 +33,8 @@ MCP-сервер, который запускается на компьютер�
    ключах в Google, и клиент отключается.
 
    ```powershell
-   .\tools\Make-Installer.ps1 -Repo <владелец>/<репозиторий> -GoogleClientPath C:\path\client_secret.json `\n     -SpreadsheetId <ID таблицы заявок>
+   .\tools\Make-Installer.ps1 -Repo <владелец>/<репозиторий> -GoogleClientPath C:\path\client_secret.json `
+     -SpreadsheetId <ID таблицы заявок>
    ```
 
 3. Раздать получившийся `Установить-MCP.bat` сотрудникам внутри компании.
