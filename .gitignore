@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.json
+!data/*.json
+data/requests.xlsx
+*.bat
+.env
