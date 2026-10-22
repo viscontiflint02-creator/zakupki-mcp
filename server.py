@@ -625,6 +625,10 @@ def self_check() -> int:
 
 
 def main() -> None:
+    if "--stdio" in sys.argv or "--check" in sys.argv:
+        # ПК в корпоративной сети: HTTPS проверяется прокси с корпоративным сертификатом.
+        from tls import use_system_certificates
+        use_system_certificates()
     if "--stdio" in sys.argv:
         run_local()
         return

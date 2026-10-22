@@ -13,6 +13,9 @@ def main():
     parser.add_argument("--local", action="store_true",
                         help="MCP на ПК сотрудника: доступ к Таблицам и только к файлам, созданным приложением")
     args = parser.parse_args()
+    # Обмен кода на токен идёт к oauth2.googleapis.com: в корпоративной сети нужен сертификат Windows.
+    from tls import use_system_certificates
+    use_system_certificates()
     if not args.credentials.is_file():
         parser.error("Скачайте OAuth client JSON типа Desktop app из Google Cloud и укажите --credentials")
     flow = InstalledAppFlow.from_client_secrets_file(str(args.credentials), LOCAL_SCOPES if args.local else SCOPES)
