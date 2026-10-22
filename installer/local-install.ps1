@@ -24,6 +24,14 @@ $serverName = 'zakupki'
 function Write-Step([string]$Text) { Write-Host "==> $Text" -ForegroundColor Cyan }
 function Write-Secret([string]$Path, [string]$Value) { [IO.File]::WriteAllText($Path, $Value, $utf8) }
 
+function Stop-McpProcesses([string]$Root) {
+    # Запущенный MCP (его процессы python держит OpenCode) блокирует файлы venv и app:
+    # без этого pip падает на занятых *.pyd и оставляет окружение сломанным наполовину.
+    Get-CimInstance Win32_Process |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($Root) } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+
 function Get-OpenCodeAsset {
     if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { return 'opencode-windows-arm64.zip' }
     Add-Type -Namespace ZakupkiMcp -Name Cpu -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint feature);'
@@ -299,6 +307,7 @@ try {
     $schema = if (([version]$version).Major -ge 2) { 'v2' } else { 'v1' }
 
     Write-Step "MCP с GitHub ($Repo, ветка $Branch)"
+    Stop-McpProcesses $root
     $unpacked = Expand-Download "https://codeload.github.com/$Repo/zip/refs/heads/$Branch" 'mcp.zip'
     $source = Get-ChildItem -LiteralPath $unpacked -Directory | Select-Object -First 1
     if (-not $source -or -not (Test-Path -LiteralPath (Join-Path $source.FullName 'server.py'))) { throw "В репозитории $Repo нет server.py" }
@@ -340,6 +349,11 @@ try {
     if ([version]$pipVersion -lt [version]'24.2') { $pipArgs += '--use-feature=truststore' }
     Write-Host '    Устанавливаю библиотеки MCP (pip, с проверкой хешей)...'
     & $python @pipArgs | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        # MCP мог перезапуститься и снова занять файлы: гасим и повторяем, иначе окружение останется сломанным.
+        Stop-McpProcesses $root
+        & $python @pipArgs | Out-Host
+    }
     if ($LASTEXITCODE -ne 0) {
         throw 'Не удалось установить библиотеки MCP с pypi.org. Если выше «certificate» - сеть не доверяет pypi.org; если «Connection» - нет доступа в интернет.'
     }
