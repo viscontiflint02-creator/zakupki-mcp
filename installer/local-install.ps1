@@ -141,6 +141,60 @@ function Install-Python {
     return $exe
 }
 
+function Stop-McpProcesses {
+    # Процессы MCP из папки установки: python, запущенный OpenCode или Kimi. В командной строке
+    # путь бывает и с «/», и с «\» - сравниваем в одном виде. Себя не трогаем.
+    $prefix = ($root.TrimEnd('\') + '\').ToLowerInvariant()
+    Get-CimInstance Win32_Process |
+        Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and
+                       $_.CommandLine.Replace('/', '\').ToLowerInvariant().Contains($prefix) } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+}
+
+function Set-McpVersion([string]$VersionDir) {
+    # app и venv в папке установки - ссылки (junction) на текущую версию: их пути знают конфиги
+    # OpenCode и Kimi. Замена ссылки не трогает файлы прежней версии, поэтому работает и при
+    # запущенном MCP - он доработает на старой версии, а при перезапуске возьмёт новую.
+    foreach ($name in 'app', 'venv') {
+        $link = Join-Path $root $name
+        $item = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            [IO.Directory]::Delete($link)  # удаляется только ссылка, не содержимое версии
+        } elseif ($item) {
+            # Обычная папка от прежнего установщика: переносим её в versions, чтобы освободить имя.
+            # Только переименование ([IO.Directory]::Move): Move-Item при отказе начинает копировать и удалять.
+            $legacy = Join-Path $root ("versions\old-$name-" + (Get-Date -Format 'yyyyMMddHHmmss'))
+            New-Item -ItemType Directory -Force -Path (Split-Path $legacy -Parent) | Out-Null
+            try {
+                [IO.Directory]::Move($link, $legacy)
+            } catch {
+                # Её держит запущенный MCP: только в этот, первый раз приходится его остановить.
+                Write-Host "    Папку $name держит запущенный MCP - останавливаю его (OpenCode и Kimi запустят MCP заново)." -ForegroundColor Yellow
+                Stop-McpProcesses
+                Start-Sleep -Seconds 2
+                try { [IO.Directory]::Move($link, $legacy) }
+                catch { throw "Папка $link занята. Закройте OpenCode и Kimi и запустите установщик снова." }
+            }
+        }
+        New-Item -ItemType Junction -Path $link -Target (Join-Path $VersionDir $name) | Out-Null
+    }
+}
+
+function Remove-OldVersions([string]$Current) {
+    # Прежние версии удаляем, только когда их никто не держит, иначе работающий MCP потерял бы
+    # файлы. Признак: папку удаётся переименовать (с загруженными *.pyd Windows не даёт).
+    # Занятые остаются и удалятся при следующей установке.
+    $versions = Join-Path $root 'versions'
+    Get-ChildItem -LiteralPath $versions -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -ne $Current } |
+        ForEach-Object {
+            # Только переименование: Move-Item при отказе копирует и удаляет файлы по одному.
+            $trash = $_.FullName.TrimEnd('\') + '.delete'
+            try { [IO.Directory]::Move($_.FullName, $trash) } catch { return }
+            Remove-Item -LiteralPath $trash -Recurse -Force -ErrorAction SilentlyContinue
+        }
+}
+
 function Remove-JsonComments([string]$Text) {
     # JSONC -> JSON: комментарии // и /* */ и висячие запятые; строки не трогаем.
     $Text = $Text.TrimStart([char]0xFEFF)
@@ -299,18 +353,18 @@ try {
     $schema = if (([version]$version).Major -ge 2) { 'v2' } else { 'v1' }
 
     Write-Step "MCP с GitHub ($Repo, ветка $Branch)"
+    # Каждая установка - в новую папку versions\<время>. Запущенный MCP (его держат OpenCode или
+    # Kimi) не даёт Windows перезаписать свои файлы («Отказано в доступе» на *.pyd), поэтому
+    # прежнюю версию не трогаем, а в конце переключаем на новую ссылки app и venv.
+    $versionDir = Join-Path $root ('versions\' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -ItemType Directory -Force -Path $versionDir | Out-Null
     $unpacked = Expand-Download "https://codeload.github.com/$Repo/zip/refs/heads/$Branch" 'mcp.zip'
     $source = Get-ChildItem -LiteralPath $unpacked -Directory | Select-Object -First 1
     if (-not $source -or -not (Test-Path -LiteralPath (Join-Path $source.FullName 'server.py'))) { throw "В репозитории $Repo нет server.py" }
-    $app = Join-Path $root 'app'
-    if (Test-Path -LiteralPath $app) { Remove-Item -LiteralPath $app -Recurse -Force }
+    $app = Join-Path $versionDir 'app'
     Move-Item -LiteralPath $source.FullName -Destination $app
-    $venv = Join-Path $root 'venv'
-    if (Test-Path -LiteralPath $venv) {
-        # Пересоздаём на своём Python; если MCP сейчас запущен OpenCode, файлы заняты - оставляем как есть.
-        try { Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction Stop }
-        catch { Write-Host '    Python-окружение занято (OpenCode открыт?) - обновляю на месте.' -ForegroundColor Yellow }
-    }
+    $venv = Join-Path $versionDir 'venv'
+
     Write-Step 'Python 3.12 и библиотеки'
     $basePython = Find-Python312
     if (-not $basePython) {
@@ -319,19 +373,17 @@ try {
     }
     Write-Host "    Python: $basePython"
     $python = Join-Path $venv 'Scripts\python.exe'
-    if (-not (Test-Path -LiteralPath $python)) {
-        # Стандартный venv: pip в нём берётся из самого Python (ensurepip), без интернета.
-        & $basePython -m venv $venv | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать Python-окружение (python -m venv).' }
-    }
+    # Стандартный venv: pip в нём берётся из самого Python (ensurepip), без интернета.
+    & $basePython -m venv $venv | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать Python-окружение (python -m venv).' }
     $ErrorActionPreference = 'Continue'
     & $python -m pip --version 2>$null | Out-Null
     $hasPip = $LASTEXITCODE -eq 0
     $ErrorActionPreference = 'Stop'
     if (-not $hasPip) {
-        # Окружение от прошлой версии установщика (uv) было без pip: добавляем его из самого Python.
+        # Некоторые сборки Python создают venv без pip: добавляем его из самого Python.
         & $python -m ensurepip --upgrade | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw 'В Python-окружении нет pip. Закройте OpenCode и запустите установщик снова.' }
+        if ($LASTEXITCODE -ne 0) { throw 'В Python-окружении нет pip (ensurepip не сработал).' }
     }
     # pip 24.2+ проверяет HTTPS через хранилище Windows (truststore) - как браузер и PowerShell,
     # поэтому корпоративная проверка HTTPS ему не мешает. У старого pip включаем это явно.
@@ -343,6 +395,9 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw 'Не удалось установить библиотеки MCP с pypi.org. Если выше «certificate» - сеть не доверяет pypi.org; если «Connection» - нет доступа в интернет.'
     }
+    Set-McpVersion $versionDir
+    Remove-OldVersions $versionDir
+    Write-Host "    Установлена версия $(Split-Path $versionDir -Leaf)"
 
     Write-Step 'Google'
     $credentials = Join-Path $state 'credentials.json'
@@ -405,7 +460,8 @@ try {
         REQUESTS_SPREADSHEET_ID = $SpreadsheetId; WORK_SHEET_NAME = $SheetName; MCP_DRIVE_FOLDER = 'Отчёты MCP'
         PYTHONUTF8 = '1'; PYTHONIOENCODING = 'utf-8'
     }
-    $command = @($python, (Join-Path $app 'server.py'), '--stdio')
+    # Постоянные пути-ссылки (app, venv): после обновлений конфиг OpenCode менять не нужно.
+    $command = @((Join-Path $root 'venv\Scripts\python.exe'), (Join-Path $root 'app\server.py'), '--stdio')
     if ($schema -eq 'v2') {
         $server = [pscustomobject]@{ type = 'local'; command = $command; environment = $environment
             timeout = [pscustomobject]@{ startup = 60000; catalog = 60000; execution = 600000 } }
