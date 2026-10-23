@@ -1,6 +1,12 @@
-﻿# Собирает «Установить-MCP.bat» для сотрудников: батник скачивает установщик с GitHub
-# и передаёт ему ключ Google-клиента. Ключ (client_secret) в GitHub не кладём: GitHub
-# сообщает о таких ключах в Google, и Google отключает клиента. Батник раздаётся внутри компании.
+﻿# Собирает «Установить-MCP.bat» для сотрудников: батник-полиглот, содержащий полный
+# текст installer/local-install.ps1 в виде обычного текста после метки ::ZAKUPKI-PS1::.
+# При запуске батник извлекает скрипт во %TEMP% и выполняет его как файл.
+# Так сделано из-за ложных срабатываний антивируса (Kaspersky Endpoint Security):
+# прежняя схема «батник качает ps1 и исполняет из памяти через scriptblock::Create»
+# — это типовой шаблон download-cradle, который эвристика режет. Здесь весь код
+# лежит в файле открытым текстом и доступен антивирусу для проверки.
+# Ключ (client_secret) в GitHub не кладём: GitHub сообщает о таких ключах в Google,
+# и Google отключает клиента. Батник раздаётся внутри компании.
 param(
     [Parameter(Mandatory = $true)][string]$Repo,
     [Parameter(Mandatory = $true)][string]$GoogleClientPath,
@@ -13,19 +19,37 @@ $ErrorActionPreference = 'Stop'
 if ($Repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'Repo: владелец/репозиторий, например ivanov/zakupki-mcp' }
 if ($Branch -notmatch '^[A-Za-z0-9_./-]+$') { throw 'Некорректная ветка' }
 if ($SpreadsheetId -notmatch '^[A-Za-z0-9_-]{20,}$') { throw 'SpreadsheetId: ID таблицы заявок из её ссылки (между /d/ и /edit)' }
-$sheet = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($SheetName))
+$marker = '::ZAKUPKI-PS1::'
+$installer = Join-Path $PSScriptRoot '..\installer\local-install.ps1'
+$body = [IO.File]::ReadAllText($installer, [Text.Encoding]::UTF8).TrimEnd("`r", "`n") -split "`r?`n"
+if ($body -contains $marker) { throw "В local-install.ps1 встречается служебная метка $marker — переименуйте её в Make-Installer.ps1" }
 $client = Get-Content -LiteralPath $GoogleClientPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if (-not $client.installed.client_id) { throw 'Нужен OAuth client JSON типа Desktop app (ключ "installed")' }
 $encoded = [Convert]::ToBase64String([IO.File]::ReadAllBytes($GoogleClientPath))
-$raw = "https://raw.githubusercontent.com/$Repo/$Branch/installer/local-install.ps1"
-$command = "`$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; " +
-    "`$r=Invoke-WebRequest -UseBasicParsing -Uri '$raw'; `$s=[Text.Encoding]::UTF8.GetString(`$r.RawContentStream.ToArray()); " +
-    "& ([scriptblock]::Create(`$s)) -Repo '$Repo' -Branch '$Branch' -GoogleClient '$encoded' -SpreadsheetId '$SpreadsheetId' -SheetName ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$sheet')))"
-$bat = @(
-    '@echo off', 'chcp 65001 >nul', 'title Zakupki MCP setup',
-    "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -Command `"$command`"",
-    'set "RC=%ERRORLEVEL%"', 'echo.', 'pause', 'exit /b %RC%', ''
-) -join "`r`n"
-[IO.File]::WriteAllText($Output, $bat, [Text.Encoding]::ASCII)
+$sheet = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($SheetName))
+
+# Командная часть — только ASCII: cmd читает .bat в текущей кодовой странице,
+# поэтому кириллица допустима только ниже метки (туда cmd не доходит из-за exit /b).
+# Извлечённый ps1 пишем с BOM, иначе PowerShell 5.1 читает его как ANSI и ломает кириллицу.
+$head = @'
+@echo off
+chcp 65001 >nul
+title Zakupki MCP setup
+set "WORKDIR=%TEMP%\zakupki-mcp-install"
+if not exist "%WORKDIR%" mkdir "%WORKDIR%"
+powershell.exe -NoLogo -NoProfile -Command "$c = [IO.File]::ReadAllLines('%~f0', [Text.Encoding]::UTF8); $i = 0; while ($i -lt $c.Count -and $c[$i] -ne '{{MARKER}}') { $i++ }; if ($i -ge $c.Count) { exit 1 }; [IO.File]::WriteAllLines($env:WORKDIR + '\local-install.ps1', [string[]]$c[($i+1)..($c.Count-1)], (New-Object System.Text.UTF8Encoding($true)))"
+if errorlevel 1 (echo Install script extraction failed.& pause& exit /b 1)
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%\local-install.ps1" -Repo '{{REPO}}' -Branch '{{BRANCH}}' -GoogleClient '{{CLIENT}}' -SpreadsheetId '{{SPREADSHEET}}' -SheetName ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{{SHEET}}')))
+set "RC=%ERRORLEVEL%"
+echo.
+pause
+exit /b %RC%
+{{MARKER}}
+'@
+$head = $head.Replace('{{MARKER}}', $marker).Replace('{{REPO}}', $Repo).Replace('{{BRANCH}}', $Branch).Replace('{{CLIENT}}', $encoded).Replace('{{SPREADSHEET}}', $SpreadsheetId).Replace('{{SHEET}}', $sheet)
+$bat = (($head -split "`n" | ForEach-Object { $_.TrimEnd("`r") }) -join "`r`n") + "`r`n" + ($body -join "`r`n") + "`r`n"
+[IO.File]::WriteAllText($Output, $bat, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "Готово: $Output" -ForegroundColor Green
 Write-Host 'Раздайте файл сотрудникам внутри компании (не выкладывайте в интернет): в нём ключ Google-клиента.'
+Write-Host 'Если антивирус всё равно блокирует — добавьте файл в исключения через администратора'
+Write-Host 'Kaspersky Security Center или отправьте его как ложное срабатывание на opentip.kaspersky.com.'
