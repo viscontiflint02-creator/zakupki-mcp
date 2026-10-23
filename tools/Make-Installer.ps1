@@ -26,10 +26,11 @@ if ($body -contains $marker) { throw "В local-install.ps1 встречаетс�
 $client = Get-Content -LiteralPath $GoogleClientPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if (-not $client.installed.client_id) { throw 'Нужен OAuth client JSON типа Desktop app (ключ "installed")' }
 $encoded = [Convert]::ToBase64String([IO.File]::ReadAllBytes($GoogleClientPath))
-$sheet = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($SheetName))
+$sheet = $SheetName
 
-# Командная часть — только ASCII: cmd читает .bat в текущей кодовой странице,
-# поэтому кириллица допустима только ниже метки (туда cmd не доходит из-за exit /b).
+# Командная часть — после chcp 65001 cmd читает .bat как UTF-8, поэтому -SheetName
+# передаём литералом в ДВОЙНЫХ кавычках: cmd не разворачивает одинарные кавычки,
+# а powershell -File не вычисляет выражения в аргументах.
 # Извлечённый ps1 пишем с BOM, иначе PowerShell 5.1 читает его как ANSI и ломает кириллицу.
 $head = @'
 @echo off
@@ -39,7 +40,7 @@ set "WORKDIR=%TEMP%\zakupki-mcp-install"
 if not exist "%WORKDIR%" mkdir "%WORKDIR%"
 powershell.exe -NoLogo -NoProfile -Command "$c = [IO.File]::ReadAllLines('%~f0', [Text.Encoding]::UTF8); $i = 0; while ($i -lt $c.Count -and $c[$i] -ne '{{MARKER}}') { $i++ }; if ($i -ge $c.Count) { exit 1 }; [IO.File]::WriteAllLines($env:WORKDIR + '\local-install.ps1', [string[]]$c[($i+1)..($c.Count-1)], (New-Object System.Text.UTF8Encoding($true)))"
 if errorlevel 1 (echo Install script extraction failed.& pause& exit /b 1)
-powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%\local-install.ps1" -Repo '{{REPO}}' -Branch '{{BRANCH}}' -GoogleClient '{{CLIENT}}' -SpreadsheetId '{{SPREADSHEET}}' -SheetName ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{{SHEET}}')))
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%\local-install.ps1" -Repo "{{REPO}}" -Branch "{{BRANCH}}" -GoogleClient "{{CLIENT}}" -SpreadsheetId "{{SPREADSHEET}}" -SheetName "{{SHEET}}"
 set "RC=%ERRORLEVEL%"
 echo.
 pause
